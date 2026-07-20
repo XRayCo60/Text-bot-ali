@@ -90,6 +90,33 @@ async Task HandleUpdateAsync(ITelegramBotClient client, Update update, Cancellat
         if (message.From.Id != OwnerId)
             return;
 
+        if (message.Chat.Type == ChatType.Private)
+        {
+            var adminText = message.Text?.Trim();
+            if (adminText == "پنل")
+            {
+                await SendAdminPanelAsync(client, message.Chat.Id, cancellationToken);
+                return;
+            }
+            if (adminText == "تنظیم لیست دارایی")
+            {
+                state.AssetSetupStep = "list-name";
+                state.DraftAssetFields.Clear();
+                state.Save("bot-state.json");
+                await client.SendTextMessageAsync(message.Chat.Id, "نام لیست دارایی را بفرستید.", cancellationToken: cancellationToken);
+                return;
+            }
+            if (adminText == "ویرایش دارایی")
+            {
+                state.AssetEditStep = "country";
+                state.Save("bot-state.json");
+                await client.SendTextMessageAsync(message.Chat.Id, "نام کشور را بفرستید.", cancellationToken: cancellationToken);
+                return;
+            }
+            if (await HandleAssetAdminFlowAsync(client, message, cancellationToken))
+                return;
+        }
+
         if (message.Chat.Type == ChatType.Private && message.Text?.Trim() == "تنظیم کانال")
         {
             await SendChannelPickerAsync(client, message.Chat.Id, cancellationToken);
@@ -109,13 +136,46 @@ async Task HandleUpdateAsync(ITelegramBotClient client, Update update, Cancellat
                 return;
             }
 
-            state.Countries[message.Chat.Id.ToString()] = new CountryAssignment
+            var newAssignment = new CountryAssignment
             {
                 Country = countryName,
                 Vip = vip
             };
+            newAssignment.EnsureAssets(state.AssetFields);
+            state.Countries[message.Chat.Id.ToString()] = newAssignment;
             state.Save("bot-state.json");
             await client.SendTextMessageAsync(message.Chat.Id, $"کشور «{countryName}» تنظیم شد. برای تعیین صاحب، به پیام فرد موردنظر پاسخ دهید و بنویسید «تنظیم صاحب».", cancellationToken: cancellationToken);
+            await RefreshPosterAsync(client, cancellationToken);
+            return;
+        }
+
+        if (message.Text is { } assetText && TryReadAssetCommand(assetText, out var assetName))
+        {
+            if (!state.Countries.TryGetValue(message.Chat.Id.ToString(), out var countryAssignment))
+            {
+                await client.SendTextMessageAsync(message.Chat.Id, "ابتدا کشور این چت را تنظیم کنید.", cancellationToken: cancellationToken);
+                return;
+            }
+            var field = state.AssetFields.FirstOrDefault(x => x.Name == assetName);
+            if (field is null)
+            {
+                await client.SendTextMessageAsync(message.Chat.Id, "این دارایی در لیست تعریف نشده است.", cancellationToken: cancellationToken);
+                return;
+            }
+            state.PendingAssetFieldByChat[message.Chat.Id.ToString()] = field.Name;
+            state.Save("bot-state.json");
+            await client.SendTextMessageAsync(message.Chat.Id, $"مقدار «{field.Name}» را بفرستید.", cancellationToken: cancellationToken);
+            return;
+        }
+
+        if (message.Chat.Type != ChatType.Private && message.Text is not null &&
+            state.PendingAssetFieldByChat.TryGetValue(message.Chat.Id.ToString(), out var pendingField) &&
+            state.Countries.TryGetValue(message.Chat.Id.ToString(), out var pendingCountry))
+        {
+            pendingCountry.Assets[pendingField] = message.Text.Trim();
+            state.PendingAssetFieldByChat.Remove(message.Chat.Id.ToString());
+            state.Save("bot-state.json");
+            await client.SendTextMessageAsync(message.Chat.Id, "مقدار دارایی ذخیره شد.", cancellationToken: cancellationToken);
             await RefreshPosterAsync(client, cancellationToken);
             return;
         }
@@ -139,6 +199,128 @@ async Task HandleUpdateAsync(ITelegramBotClient client, Update update, Cancellat
     {
         Console.Error.WriteLine(ex);
     }
+}
+
+async Task SendAdminPanelAsync(ITelegramBotClient client, long chatId, CancellationToken cancellationToken)
+{
+    var keyboard = new ReplyKeyboardMarkup(new[]
+    {
+        new[] { new KeyboardButton("تنظیم لیست دارایی") },
+        new[] { new KeyboardButton("ویرایش دارایی") }
+    }) { ResizeKeyboard = true };
+    await client.SendTextMessageAsync(chatId, "پنل مدیریت:", replyMarkup: keyboard, cancellationToken: cancellationToken);
+}
+
+async Task<bool> HandleAssetAdminFlowAsync(ITelegramBotClient client, Message message, CancellationToken cancellationToken)
+{
+    var text = message.Text?.Trim();
+    if (string.IsNullOrWhiteSpace(text))
+        return false;
+
+    if (state.AssetSetupStep == "list-name")
+    {
+        state.AssetListName = text;
+        state.AssetSetupStep = "field-name";
+        state.Save("bot-state.json");
+        await client.SendTextMessageAsync(message.Chat.Id, "نام دارایی بعدی را بفرستید. برای پایان «پایان» بنویسید. کشور و صاحب به‌صورت خودکار در ابتدای هر ردیف هستند.", cancellationToken: cancellationToken);
+        return true;
+    }
+    if (state.AssetSetupStep == "field-name")
+    {
+        if (text == "پایان")
+        {
+            if (state.DraftAssetFields.Count == 0)
+            {
+                await client.SendTextMessageAsync(message.Chat.Id, "حداقل یک دارایی اضافه کنید، یا دوباره «تنظیم لیست دارایی» را بزنید.", cancellationToken: cancellationToken);
+                return true;
+            }
+            state.AssetFields = state.DraftAssetFields.ToList();
+            state.DraftAssetFields.Clear();
+            state.AssetSetupStep = string.Empty;
+            foreach (var country in state.Countries.Values)
+                country.EnsureAssets(state.AssetFields);
+            state.Save("bot-state.json");
+            await client.SendTextMessageAsync(message.Chat.Id, $"لیست «{state.AssetListName}» ذخیره شد.", cancellationToken: cancellationToken);
+            return true;
+        }
+        state.DraftAssetFieldName = text;
+        state.AssetSetupStep = "field-default";
+        state.Save("bot-state.json");
+        await client.SendTextMessageAsync(message.Chat.Id, $"مقدار اولیه «{text}» را بفرستید.", cancellationToken: cancellationToken);
+        return true;
+    }
+    if (state.AssetSetupStep == "field-default")
+    {
+        if (state.DraftAssetFields.Any(x => x.Name == state.DraftAssetFieldName))
+        {
+            await client.SendTextMessageAsync(message.Chat.Id, "این نام قبلاً اضافه شده است؛ نام دیگری بفرستید.", cancellationToken: cancellationToken);
+            state.AssetSetupStep = "field-name";
+            state.Save("bot-state.json");
+        }
+        else
+        {
+            state.DraftAssetFields.Add(new AssetField { Name = state.DraftAssetFieldName, DefaultValue = text });
+            state.AssetSetupStep = "field-name";
+            state.Save("bot-state.json");
+            await client.SendTextMessageAsync(message.Chat.Id, "دارایی بعدی را بفرستید، یا برای پایان «پایان» بنویسید.", cancellationToken: cancellationToken);
+        }
+        return true;
+    }
+
+    if (state.AssetEditStep == "country")
+    {
+        var match = state.Countries.FirstOrDefault(x => x.Value.Country == text);
+        if (match.Value is null)
+        {
+            await client.SendTextMessageAsync(message.Chat.Id, "کشوری با این نام پیدا نشد.", cancellationToken: cancellationToken);
+            return true;
+        }
+        state.DraftCountryChatId = long.Parse(match.Key);
+        state.AssetEditStep = "field";
+        state.Save("bot-state.json");
+        await client.SendTextMessageAsync(message.Chat.Id, "نام دارایی را بفرستید (کشور و صاحب قابل تغییر نیستند).", cancellationToken: cancellationToken);
+        return true;
+    }
+    if (state.AssetEditStep == "field")
+    {
+        var field = state.AssetFields.FirstOrDefault(x => x.Name == text);
+        if (field is null)
+        {
+            await client.SendTextMessageAsync(message.Chat.Id, "این دارایی در لیست تعریف نشده است.", cancellationToken: cancellationToken);
+            return true;
+        }
+        state.DraftAssetFieldName = field.Name;
+        state.AssetEditStep = "value";
+        state.Save("bot-state.json");
+        await client.SendTextMessageAsync(message.Chat.Id, $"مقدار جدید «{field.Name}» را بفرستید.", cancellationToken: cancellationToken);
+        return true;
+    }
+    if (state.AssetEditStep == "value")
+    {
+        if (state.DraftCountryChatId is long chatId && state.Countries.TryGetValue(chatId.ToString(), out var country))
+        {
+            country.EnsureAssets(state.AssetFields);
+            country.Assets[state.DraftAssetFieldName] = text;
+            state.Save("bot-state.json");
+            await client.SendTextMessageAsync(message.Chat.Id, "دارایی کشور به‌روزرسانی شد.", cancellationToken: cancellationToken);
+            await RefreshPosterAsync(client, cancellationToken);
+        }
+        state.AssetEditStep = string.Empty;
+        state.DraftCountryChatId = null;
+        return true;
+    }
+    return false;
+}
+
+static bool TryReadAssetCommand(string text, out string assetName)
+{
+    const string prefix = "ست دارایی";
+    assetName = string.Empty;
+    var value = text.Trim();
+    if (!value.StartsWith(prefix, StringComparison.Ordinal))
+        return false;
+    assetName = value[prefix.Length..].Trim();
+    return assetName.Length > 0;
 }
 
 async Task HandleCallbackAsync(ITelegramBotClient client, CallbackQuery callback, CancellationToken cancellationToken)
@@ -244,6 +426,12 @@ string BuildCaption()
             var owner = System.Net.WebUtility.HtmlEncode(assignment.OwnerName ?? "صاحب کشور");
             result.Append($" — <a href=\"tg://user?id={ownerId}\">{owner}</a>");
         }
+        assignment.EnsureAssets(state.AssetFields);
+        foreach (var field in state.AssetFields)
+        {
+            var assetValue = System.Net.WebUtility.HtmlEncode(assignment.Assets[field.Name]);
+            result.Append($"\n  {System.Net.WebUtility.HtmlEncode(field.Name)}: {assetValue}");
+        }
         result.Append('\n');
     }
     return result.ToString();
@@ -281,6 +469,14 @@ sealed class BotState
     public string? PosterFileId { get; set; }
     public int? PosterMessageId { get; set; }
     public bool WaitingForPhoto { get; set; }
+    public string AssetListName { get; set; } = string.Empty;
+    public List<AssetField> AssetFields { get; set; } = new();
+    public List<AssetField> DraftAssetFields { get; set; } = new();
+    public string DraftAssetFieldName { get; set; } = string.Empty;
+    public string AssetSetupStep { get; set; } = string.Empty;
+    public string AssetEditStep { get; set; } = string.Empty;
+    public long? DraftCountryChatId { get; set; }
+    public Dictionary<string, string> PendingAssetFieldByChat { get; set; } = new();
     public Dictionary<string, CountryAssignment> Countries { get; set; } = new();
     public List<KnownChannel> Channels { get; set; } = new();
 
@@ -313,6 +509,20 @@ sealed class CountryAssignment
     public bool Vip { get; set; }
     public long? OwnerId { get; set; }
     public string? OwnerName { get; set; }
+    public Dictionary<string, string> Assets { get; set; } = new();
+
+    public void EnsureAssets(IEnumerable<AssetField> fields)
+    {
+        foreach (var field in fields)
+            if (!Assets.ContainsKey(field.Name))
+                Assets[field.Name] = field.DefaultValue;
+    }
+}
+
+sealed class AssetField
+{
+    public string Name { get; set; } = string.Empty;
+    public string DefaultValue { get; set; } = string.Empty;
 }
 
 sealed class KnownChannel
